@@ -16,8 +16,9 @@
 package io.netty.handler.fileregion;
 
 
+import java.nio.channels.SelectableChannel;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.WritableByteChannel;
-import java.util.concurrent.TimeUnit;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.MessageBuf;
@@ -32,6 +33,8 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventExecutor;
 import io.netty.channel.socket.nio.AbstractNioChannel;
 import io.netty.channel.socket.nio.AbstractNioChannel.NioUnsafe;
+import io.netty.channel.socket.nio.NioEventLoop;
+import io.netty.channel.socket.nio.NioTask;
 
 /**
  * {@link ChannelOutboundMessageHandlerAdapter} which allows for zero-copy-transfer via {@link FileRegion}.
@@ -161,34 +164,53 @@ public final class FileRegionHandler extends ChannelOutboundMessageHandlerAdapte
                     // Close the file-region
                     region.close();
 
-                    MessageBuf<?> messageBuf = ctx.outboundMessageBuffer();
-                    for (;;) {
-                        Object msg = messageBuf.poll();
-                        try {
-                            if (msg == null) {
-                                break;
-                            }
-                            if (flush(ctx, msg, false)) {
-                                break;
-                            } else {
-                                // we wrote something else then a FileRegion time to flush to not mess up order of
-                                // messages
-                                ctx.flush(ctx.newFuture());
-                            }
-                        } catch (Throwable t) {
-                            // TODO: Should we break out of the loop here ?
-                            ctx.fireExceptionCaught(t);
-                        }
-                    }
+                    processBuffers(ctx);
                 } else {
-                    // Transfer of FileRegion not complete yet, schedule the next run in 100ms.
-                    //
-                    // This sucks it would be better if we could schedule a task for the next eventloop run.
-                    // Need to think about howto implement this.
-                    //
-                    // TODO: Replace this
-                    ctx.executor().schedule(this, 100, TimeUnit.MILLISECONDS);
+                    NioEventLoop loop = (NioEventLoop) ctx.executor();
+                    loop.executeWhenWritable((AbstractNioChannel) ctx.channel(), new NioTask<SelectableChannel>() {
+                        @Override
+                        public void channelReady(SelectableChannel ch, SelectionKey key) throws Exception {
+                            TransferTask.this.run();
+                        }
+
+                        @Override
+                        public void channelUnregistered(SelectableChannel ch) throws Exception {
+                            // ignore
+                        }
+                    });
                 }
+            }
+        }
+    }
+
+    private void processBuffers(final ChannelHandlerContext ctx) {
+        MessageBuf<?> messageBuf = ctx.outboundMessageBuffer();
+        for (;;) {
+            Object msg = messageBuf.poll();
+            try {
+                if (msg == null) {
+                    break;
+                }
+                if (flush(ctx, msg, false)) {
+                    break;
+                } else {
+                    // we wrote something else then a FileRegion time to flush to not mess up order of
+                    // messages
+                    ChannelFuture future = ctx.flush(ctx.newFuture()).addListener(new ChannelFutureListener() {
+                        @Override
+                        public void operationComplete(ChannelFuture future) throws Exception {
+                            if (future.isSuccess()) {
+                                processBuffers(ctx);
+                            } else {
+                                ctx.fireExceptionCaught(future.cause());
+                            }
+                        }
+                    });
+                    break;
+                }
+            } catch (Throwable t) {
+                ctx.fireExceptionCaught(t);
+                break;
             }
         }
     }
